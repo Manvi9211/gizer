@@ -1,69 +1,73 @@
+"""
+db.py
+Database connection and schema initialization.
+Uses SQLite with simple threading config — no WAL mode
+to avoid locking issues with Dash's multi-threaded server.
+"""
+
 import sqlite3
 import os
 
-DB_PATH = "github_data.db"
+# Store DB in same directory as script
+DB_PATH = os.path.join(os.path.dirname(
+    os.path.abspath(__file__)), "github_data.db")
 
 
 def get_connection():
     """
-    Returns a SQLite connection.
-    In production (Azure), swap this with PostgreSQL using SQLAlchemy.
+    Returns a fresh SQLite connection.
+    Called per-operation — never shared across threads.
+    This is the correct pattern for SQLite + multi-threaded apps.
     """
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, timeout=20)
+    conn.row_factory = sqlite3.Row
+    # Do NOT use WAL mode here — it causes locking with Dash threads
+    conn.execute("PRAGMA foreign_keys = ON;")
     return conn
 
 
 def initialize_db():
     """
     Creates all tables if they don't exist.
-    Run this once at startup.
+    Safe to call multiple times.
     """
     conn = get_connection()
     cursor = conn.cursor()
 
     cursor.executescript("""
-        -- Stores one row per repository
         CREATE TABLE IF NOT EXISTS repos (
             id          INTEGER PRIMARY KEY,
             name        TEXT,
             full_name   TEXT,
-            language    TEXT,       -- primary language
+            language    TEXT,
             stars       INTEGER,
             forks       INTEGER,
             open_issues INTEGER,
             created_at  TEXT,
             updated_at  TEXT,
-            pushed_at   TEXT,       -- last commit push time
-            description TEXT,
-            username     TEXT,
-            PRIMARY KEY (id, username)         
+            pushed_at   TEXT,
+            description TEXT
         );
 
-        -- Stores one row per commit across all repos
         CREATE TABLE IF NOT EXISTS commits (
-            sha         TEXT PRIMARY KEY,  -- unique commit hash
-            username    TEXT,             
+            sha         TEXT PRIMARY KEY,
             repo_name   TEXT,
-            author      TEXT,              -- GitHub username
-            date        TEXT,              -- ISO 8601 format
-            message     TEXT,
-            PRIMARY KEY (sha, username)
+            author      TEXT,
+            date        TEXT,
+            message     TEXT
         );
 
-        -- Stores one row per pull request
         CREATE TABLE IF NOT EXISTS pull_requests (
             id          INTEGER PRIMARY KEY,
             repo_name   TEXT,
             title       TEXT,
-            state       TEXT,       -- open / closed
+            state       TEXT,
             created_at  TEXT,
-            merged_at   TEXT,       -- NULL if not merged
-            additions   INTEGER,    -- lines added
-            deletions   INTEGER     -- lines removed
+            merged_at   TEXT,
+            additions   INTEGER,
+            deletions   INTEGER
         );
 
-        -- Stores language byte counts per repo
-        -- GitHub returns {"Python": 12400, "JavaScript": 3200}
         CREATE TABLE IF NOT EXISTS languages (
             repo_name   TEXT,
             language    TEXT,
@@ -74,4 +78,4 @@ def initialize_db():
 
     conn.commit()
     conn.close()
-    print("DB initialized successfully.")
+    print("Database initialized.")

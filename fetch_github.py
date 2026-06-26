@@ -1,228 +1,271 @@
-import requests
-import sqlite3
+"""
+fetch_github.py
+Fetches data from GitHub REST API and stores in SQLite.
+
+Key fix: store_all_data() opens + closes connection
+after EACH repo so SQLite never stays locked.
+"""
+
+from __future__ import annotations
+
 import os
 import time
+import requests
 from dotenv import load_dotenv
 from db import get_connection
 
-load_dotenv()  # loads .env file
+load_dotenv()
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 BASE_URL = "https://api.github.com"
+REQUEST_TIMEOUT = 30
 
-# All API calls go through this function
-# It handles auth headers + rate limit retries automatically
+HEADERS = {
+    "Accept": "application/vnd.github+json",
+}
+if GITHUB_TOKEN:
+    HEADERS["Authorization"] = f"Bearer {GITHUB_TOKEN}"
 
 
-def api_get(endpoint, params=None):
+# ---------------------------------------------------------
+# Core Request Function
+# ---------------------------------------------------------
+
+def github_get(endpoint: str, params: dict | None = None):
     """
-    Makes a GET request to GitHub API.
-    Automatically retries if rate limited (429 or 403).
-
-    GitHub allows 5000 requests/hour with token.
-    Without token: only 60/hour — useless for this project.
+    GET request to GitHub API.
+    Handles rate limiting with automatic retry.
+    Raises RuntimeError on failure.
     """
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
-    }
     url = f"{BASE_URL}{endpoint}"
 
     while True:
-        response = requests.get(url, headers=headers, params=params)
+        response = requests.get(
+            url,
+            headers=HEADERS,
+            params=params,
+            timeout=REQUEST_TIMEOUT
+        )
 
         if response.status_code == 200:
             return response.json()
 
-        elif response.status_code == 403:
-            # Rate limit hit — GitHub tells you when it resets
+        if response.status_code == 403:
+            # Rate limit — wait until reset
             reset_time = int(response.headers.get(
                 "X-RateLimit-Reset", time.time() + 60))
             wait = max(reset_time - int(time.time()), 1)
             print(f"Rate limited. Waiting {wait}s...")
             time.sleep(wait)
+            continue
 
-        elif response.status_code == 404:
-            print(f"Not found: {url}")
-            return None
+        if response.status_code == 404:
+            raise RuntimeError(f"Not found: {url}")
 
-        else:
-            print(f"Error {response.status_code} for {url}")
-            return None
+        raise RuntimeError(
+            f"GitHub API Error {response.status_code}: {response.text[:200]}"
+        )
 
 
-def fetch_repos(username):
-    """
-    Fetches all public repos for a GitHub user.
-    Handles pagination — GitHub returns max 100 per page.
-    """
+# ---------------------------------------------------------
+# Fetch Functions — API only, no DB
+# ---------------------------------------------------------
+
+def fetch_repos(username: str) -> list:
+    print(f"Fetching repos for {username}...")
     repos = []
     page = 1
 
     while True:
-        data = api_get(f"/users/{username}/repos", params={
+        data = github_get(f"/users/{username}/repos", params={
             "per_page": 100,
             "page": page,
             "sort": "updated"
         })
-
-        if not data:  # empty page = no more repos
+        if not data:
             break
-
         repos.extend(data)
         page += 1
-
-        # GitHub paginates — if less than 100 returned, we're on last page
         if len(data) < 100:
             break
 
+    print(f"  Found {len(repos)} repos.")
     return repos
 
 
-def fetch_commits(username, repo_name, max_pages=5):
-    """
-    Fetches commits for a single repo.
-    max_pages=5 means max 500 commits per repo.
-    Increase for very active repos.
-    """
-    commits = []
-    page = 1
-
-    while page <= max_pages:
-        data = api_get(f"/repos/{username}/{repo_name}/commits", params={
-            "per_page": 100,
-            "page": page,
-            "author": username  # only this user's commits
-        })
-
-        if not data:
-            break
-
-        commits.extend(data)
-        page += 1
-
-        if len(data) < 100:
-            break
-
-    return commits
+def fetch_commits(username: str, repo_name: str) -> list:
+    print(f"  Fetching commits -> {repo_name}")
+    try:
+        return github_get(
+            f"/repos/{username}/{repo_name}/commits",
+            params={"per_page": 100, "author": username}
+        )
+    except Exception as e:
+        print(f"  Skipping commits for {repo_name}: {e}")
+        return []
 
 
-def fetch_pull_requests(username, repo_name):
-    """
-    Fetches ALL PRs (open + closed) for a repo.
-    state=all is important — we want merge rate calculation.
-    """
-    prs = []
-    page = 1
-
-    while True:
-        data = api_get(f"/repos/{username}/{repo_name}/pulls", params={
-            "state": "all",
-            "per_page": 100,
-            "page": page
-        })
-
-        if not data:
-            break
-
-        prs.extend(data)
-        page += 1
-
-        if len(data) < 100:
-            break
-
-    return prs
+def fetch_pull_requests(username: str, repo_name: str) -> list:
+    print(f"  Fetching PRs -> {repo_name}")
+    try:
+        prs = github_get(
+            f"/repos/{username}/{repo_name}/pulls",
+            params={"state": "all", "per_page": 100}
+        )
+        detailed = []
+        for pr in prs:
+            try:
+                detail = github_get(
+                    f"/repos/{username}/{repo_name}/pulls/{pr['number']}"
+                )
+                detailed.append(detail)
+            except Exception:
+                detailed.append(pr)
+        return detailed
+    except Exception as e:
+        print(f"  Skipping PRs for {repo_name}: {e}")
+        return []
 
 
-def fetch_languages(username, repo_name):
-    """
-    Returns language byte breakdown for a repo.
-    Example: {"Python": 15420, "HTML": 3200}
-    """
-    return api_get(f"/repos/{username}/{repo_name}/languages") or {}
+def fetch_languages(username: str, repo_name: str) -> dict:
+    print(f"  Fetching languages -> {repo_name}")
+    try:
+        return github_get(f"/repos/{username}/{repo_name}/languages") or {}
+    except Exception as e:
+        print(f"  Skipping languages for {repo_name}: {e}")
+        return {}
 
 
-def store_all_data(username):
-    """
-    Master function — fetches everything and stores in DB.
-    Call this from scheduler or manually.
-    """
-    conn = get_connection()
-    cursor = conn.cursor()
+# ---------------------------------------------------------
+# Store Functions — DB only, no API
+# ---------------------------------------------------------
 
-    print(f"Fetching repos for {username}...")
-    repos = fetch_repos(username)
+def store_repo(cursor, repo: dict):
+    cursor.execute("""
+        INSERT OR REPLACE INTO repos
+        (id, name, full_name, language, stars, forks,
+         open_issues, created_at, updated_at, pushed_at, description)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        repo["id"],
+        repo["name"],
+        repo["full_name"],
+        repo.get("language"),
+        repo.get("stargazers_count", 0),
+        repo.get("forks_count", 0),
+        repo.get("open_issues_count", 0),
+        repo.get("created_at"),
+        repo.get("updated_at"),
+        repo.get("pushed_at"),
+        repo.get("description", "")[:500] if repo.get("description") else None
+    ))
 
-    for repo in repos:
-        repo_name = repo["name"]
-        print(f"  Processing: {repo_name}")
 
-        # --- Store repo ---
-        cursor.execute("""
-            INSERT OR REPLACE INTO repos 
-            (id, name, full_name, language, stars, forks, open_issues, 
-             created_at, updated_at, pushed_at, description)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            repo["id"],
-            repo["name"],
-            repo["full_name"],
-            repo.get("language"),       # can be None
-            repo["stargazers_count"],
-            repo["forks_count"],
-            repo["open_issues_count"],
-            repo["created_at"],
-            repo["updated_at"],
-            repo["pushed_at"],
-            repo.get("description")
-        ))
-
-        # --- Store commits ---
-        commits = fetch_commits(username, repo_name)
-        for c in commits:
-            # Nested structure: commit.author.date
-            author = c.get("author") or {}
+def store_commits(cursor, repo_name: str, commits: list):
+    for c in commits:
+        try:
             commit_data = c.get("commit", {})
             commit_author = commit_data.get("author", {})
+            github_author = c.get("author") or {}
+
+            author_login = (
+                github_author.get("login")
+                or commit_author.get("name")
+                or "unknown"
+            )
 
             cursor.execute("""
-                INSERT OR IGNORE INTO commits (sha, repo_name, author, date, message)
+                INSERT OR IGNORE INTO commits
+                (sha, repo_name, author, date, message)
                 VALUES (?, ?, ?, ?, ?)
             """, (
                 c["sha"],
                 repo_name,
-                author.get("login", commit_author.get("name", "unknown")),
+                author_login,
                 commit_author.get("date"),
-                commit_data.get("message", "")[:500]  # cap at 500 chars
+                commit_data.get("message", "")[:500]
             ))
+        except Exception as e:
+            print(f"    Skipping commit: {e}")
 
-        # --- Store PRs ---
-        prs = fetch_pull_requests(username, repo_name)
-        for pr in prs:
+
+def store_pull_requests(cursor, repo_name: str, prs: list):
+    for pr in prs:
+        try:
             cursor.execute("""
-                INSERT OR REPLACE INTO pull_requests 
+                INSERT OR REPLACE INTO pull_requests
                 (id, repo_name, title, state, created_at, merged_at, additions, deletions)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 pr["id"],
                 repo_name,
-                pr["title"][:300],
-                pr["state"],
-                pr["created_at"],
-                pr.get("merged_at"),    # None if not merged
+                pr.get("title", "")[:300],
+                pr.get("state"),
+                pr.get("created_at"),
+                pr.get("merged_at"),
                 pr.get("additions", 0),
                 pr.get("deletions", 0)
             ))
+        except Exception as e:
+            print(f"    Skipping PR: {e}")
 
-        # --- Store languages ---
-        languages = fetch_languages(username, repo_name)
-        for lang, byte_count in languages.items():
+
+def store_languages(cursor, repo_name: str, languages: dict):
+    for lang, byte_count in languages.items():
+        try:
             cursor.execute("""
                 INSERT OR REPLACE INTO languages (repo_name, language, bytes)
                 VALUES (?, ?, ?)
             """, (repo_name, lang, byte_count))
+        except Exception as e:
+            print(f"    Skipping language {lang}: {e}")
 
-        conn.commit()  # commit after each repo — don't lose progress
 
-    conn.close()
-    print(f"Done. Stored {len(repos)} repos for {username}.")
+# ---------------------------------------------------------
+# Master Function — called from app.py
+# ---------------------------------------------------------
+
+def store_all_data(username: str):
+    """
+    Fetches all GitHub data for a user and stores in SQLite.
+
+    KEY DESIGN:
+    - Opens a NEW connection per repo
+    - Commits + closes after each repo
+    - This prevents SQLite from staying locked
+      while Dash is also trying to read
+
+    This is the function app.py calls.
+    """
+    repos = fetch_repos(username)
+
+    if not repos:
+        raise RuntimeError(f"No public repos found for '{username}'")
+
+    for repo in repos:
+        repo_name = repo["name"]
+        print(f"\nProcessing: {repo_name}")
+
+        # Fetch from API (no DB connection open yet)
+        commits = fetch_commits(username, repo_name)
+        prs = fetch_pull_requests(username, repo_name)
+        languages = fetch_languages(username, repo_name)
+
+        # Open connection, write everything, close immediately
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        try:
+            store_repo(cursor, repo)
+            store_commits(cursor, repo_name, commits)
+            store_pull_requests(cursor, repo_name, prs)
+            store_languages(cursor, repo_name, languages)
+            conn.commit()
+            print(f"  Saved: {len(commits)} commits, {len(prs)} PRs")
+        except Exception as e:
+            conn.rollback()
+            print(f"  DB error for {repo_name}: {e}")
+        finally:
+            conn.close()  # ALWAYS close — prevents lock
+
+    print(f"\nDone. Processed {len(repos)} repos for {username}.")
